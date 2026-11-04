@@ -1,30 +1,132 @@
-# This is a basic workflow that is manually triggered
+name: Compile Screen On
 
-name: Nuitka compile (stub)
-
-# Controls when the action will run. Workflow runs when manually triggered using the UI
-# or API.
 on:
+  push:
+  pull_request:
   workflow_dispatch:
-    # Inputs the workflow accepts.
-    inputs:
-      name:
-        # Friendly description to be shown in the UI instead of 'name'
-        description: 'Person to greet'
-        # Default value if no value is explicitly provided
-        default: 'World'
-        # Input has to be provided for the workflow to run
-        required: true
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
 jobs:
-  # This workflow contains a single job called "greet"
-  greet:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  compile:
+    name: Windows x64 (Tkinter)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHON_VERSION: '3.11'
+      NUITKA_VERSION: '2.8.4'
+      ORDERED_SET_VERSION: '4.1.0'
+      ZSTANDARD_VERSION: '0.25.0'
+      BUILD_DIR: build
+      ARTIFACT_NAME: screen_on-windows-x64
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-    # Runs a single command using the runners shell
-    - name: Send greeting
-      run: echo "Hello ${{ github.event.inputs.name }}"
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+
+      # compile.py depends on support.compile, which is absent from this repo.
+      # Invoke its intended Nuitka/Tkinter build directly, preserving source files.
+      - name: Install build dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "Nuitka==$env:NUITKA_VERSION" "ordered-set==$env:ORDERED_SET_VERSION" "zstandard==$env:ZSTANDARD_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Build dependency installation failed.' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Build dependencies are inconsistent.' }
+
+      - name: Validate source and runtime dependencies
+        run: |
+          @'
+          from pathlib import Path
+          import struct
+          import tkinter
+          import _tkinter
+          import itaskbarlist3
+
+          assert struct.calcsize('P') == 8, 'An x64 Python interpreter is required'
+          for name in ('main_tk.py', 'itaskbarlist3.py'):
+              source = Path(name)
+              compile(source.read_bytes(), str(source), 'exec')
+          for name in ('assets/sun_white.ico', 'LICENSE', 'assets/ATTRIBUTION.md'):
+              assert Path(name).is_file(), f'Missing build input: {name}'
+          print('Tcl:', tkinter.Tcl().eval('info patchlevel'))
+          print('Tk:', _tkinter.TK_VERSION)
+          print('Windows COM module imported successfully')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Source or runtime dependency validation failed.' }
+
+      - name: Compile standalone application
+        run: |
+          python -m nuitka `
+            --mode=standalone `
+            --msvc=latest `
+            --enable-plugin=tk-inter `
+            --windows-console-mode=disable `
+            --windows-icon-from-ico=assets/sun_white.ico `
+            --include-data-files=assets/sun_white.ico=assets/sun_white.ico `
+            --assume-yes-for-downloads `
+            --output-dir="$env:BUILD_DIR" `
+            --report="$env:BUILD_DIR/compilation-report.xml" `
+            main_tk.py
+          if ($LASTEXITCODE -ne 0) { throw 'Nuitka compilation failed.' }
+
+      - name: Package portable application
+        run: |
+          $distribution = Join-Path $env:BUILD_DIR 'main_tk.dist'
+          foreach ($relativePath in @('main_tk.exe', 'assets/sun_white.ico')) {
+            $requiredFile = Join-Path $distribution $relativePath
+            if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+              throw "Missing compiled output: $requiredFile"
+            }
+          }
+          Copy-Item -LiteralPath 'LICENSE' -Destination $distribution
+          Copy-Item -LiteralPath 'assets/ATTRIBUTION.md' -Destination (Join-Path $distribution 'assets')
+
+          # The original app resolves its icon relative to the working directory.
+          # This launcher also works when opened through a shortcut elsewhere.
+          @'
+          @echo off
+          cd /d "%~dp0"
+          start "" "%~dp0main_tk.exe"
+          '@ | Set-Content -LiteralPath (Join-Path $distribution 'Screen On.cmd') -Encoding ascii
+
+          @'
+          Extract the entire ZIP before running Screen On.cmd.
+          Keep the executable, DLLs, Tcl/Tk runtime and assets together.
+          Screen On.cmd sets the working directory required by the application.
+          For a direct executable shortcut, set "Start in" to this folder.
+          '@ | Set-Content -LiteralPath (Join-Path $distribution 'RUNNING.txt') -Encoding ascii
+
+          $archive = Join-Path $env:BUILD_DIR "$env:ARTIFACT_NAME.zip"
+          Compress-Archive -Path $distribution -DestinationPath $archive -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw 'Portable archive was not created.'
+          }
+
+      - name: Upload portable application
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.BUILD_DIR }}/${{ env.ARTIFACT_NAME }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload compilation report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuitka-compilation-report
+          path: ${{ env.BUILD_DIR }}/compilation-report.xml
+          if-no-files-found: ignore
+          retention-days: 7
